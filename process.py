@@ -114,6 +114,23 @@ def scan_files(path=None, pattern=None, file_type=None):
     print(f'match count', len(matches))
     return matches
 
+def arg_setup():
+    # set up argument parser
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-c", "--config", required=True, \
+        help="Path to the configuration file to be used for processing images.")
+    ap.add_argument("-i", "--input_path", required=False, \
+        help="Input directory path - overrides input_path in config file")
+    ap.add_argument("-v", "--verbose", action="store_true", \
+        help="Detailed output.")
+    ap.add_argument("-n", "--dry_run", action="store_true", \
+        help="Simulate the sort process without moving files or creating directories.")
+    ap.add_argument("-f", "--force", action="store_true", \
+        help="Force overwrite of existing files.")
+    ap.add_argument("-s", "--subset", action="store_true", \
+        help="Subset input folders by parent folder name of image (not parent of input folder).")
+    args = vars(ap.parse_args())
+    return args
 
 class Settings():
     def __init__(self, prefix=None, dry_run=None, verbose=None, force_overwrite=None):
@@ -121,6 +138,7 @@ class Settings():
         self.dry_run = dry_run
         self.verbose = verbose
         self.force_overwrite = force_overwrite
+        self.subset = subset
 
     def load_config(self, config_file=None):
         # load config file
@@ -152,6 +170,7 @@ if __name__ == '__main__':
     verbose = args['verbose']
     force_overwrite = args['force']
     input_path_override = args['input_path']
+    subset = args['subset']
 
     """
     #TODO reactivate input path override
@@ -226,11 +245,13 @@ if __name__ == '__main__':
     print(f'archives found:', archives)
     # if any archives, unpack them
     if archives:
-        unpacked = unpack_archives(archives)#, delete_archive=False
+        unpacked = unpack_archives(archives)  # , delete_archive=False
         print(f'unpacked archives :', unpacked)
 
     # subset based on parent folders, if flag says to
-
+    if subset:
+        print(f'do subset here')
+    
     # start sorting
     # call powersorter.py
 
