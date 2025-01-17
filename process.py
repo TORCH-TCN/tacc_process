@@ -1,22 +1,22 @@
-import json
-#import re
-import os
-from pathlib import Path
-import shutil
-import datetime
-#import csv
-import pwd
-import argparse
-import datetime
+"""
+An all in one processing script for TORCH files on TACC.
+Adds -subset, -generate derivatives, and -unpack options.
+Finally calls Powersorter.py and Url_gen.py.
+"""
 import sys
-import glob
 from zipfile import ZipFile
-
-print(f'STARTING')
-
-CONFIG_FORMAT_REQUIRED = '3.0'
-sorted_file_count = 0
-unmoved_file_count = 0
+import powersorterRF1 as powersorter
+#import url_genRF1 as url_gen
+from url_genRF1 import generate_url_records_suffixes
+import shutil
+from pathlib import Path
+import os
+import glob
+import csv
+import re
+from wand.image import Image
+from collections import Counter
+Problem = []
 
 def scan_for_archives(dir):
     '''
@@ -27,22 +27,31 @@ def scan_for_archives(dir):
 
     other_exts = [i[1] for i in shutil.get_unpack_formats()]
     ext_patterns = ['*' + i for g in other_exts for i in g]
-    # print(ext_patterns)
+    #print(ext_patterns)
     try:
-        folders = [f for f in Path(dir).iterdir()]
+        everything = [f for f in Path(dir).iterdir()]
+        #folders = [f for f in Path(dir).iterdir() if f.is_dir()]
         archives = [f for f in Path(dir).iterdir() if any(f.match(p) for p in ext_patterns)]
-        print(f'found', len(archives), 'archives to unpack out of', len(folders), 'total folders')
+        #print(f'everything: {everything} \n fold: {folders} \n arch: {archives}')
+        not_unpackable = [f for f in Path(dir).iterdir() if '.' in f.suffix if not any(f.match(p) for p in ext_patterns)]
+        #print(not_unpackable)
+        #print(f'{len(everything), len(folders), len(archives), len(not_unpackable)}')
+        print(f'found {len(archives)} archives to unpack out of {len(everything)} total folders and/or archives.')
+        if not_unpackable:
+            print(f'found {len(not_unpackable)} archives that cannot be unpacked: {not_unpackable}')
+            msg = 'could not unpack ' + str(not_unpackable)
+            #print(f'{msg}')
+            Problem.append([msg])
         result = archives
-    except:
-        print(dir, 'not a valid path')
+    except Exception as e:
+        print(f'Exception processing {dir}: due to {e}')
 
     return result
-
 
 def unpack_archives(archive_paths, delete_archive=True):
     '''
     Accepts a list of folder(s) (paths?). Replaces them with unzipped folder of the same name.
-    Zips it tests for corruptions then only extracts the JPG and DNG file extensions found.
+    Zips it tests for corruptions then only extracts the JPG and DNG file extensions found (tested up to 65 GB).
     Other archive types are handled by shutil.
     '''
     result = []
@@ -53,6 +62,7 @@ def unpack_archives(archive_paths, delete_archive=True):
         name = arc.stem
         # ext = arc.suffixes
         new_folder = os.path.join(loc, name)
+        unpacked = 0
 
         try:
             # if zip, just unpack JPG/DNG using ZipFile
@@ -62,134 +72,205 @@ def unpack_archives(archive_paths, delete_archive=True):
                     ret = zip_object.testzip()
                     if ret is not None:
                         print(f'First bad file in zip:', ret)
+                        Problem.append(ret)
                     else:
-                        print(f'Zip archive is good.')
+                        print(f'Zip archive', arc, 'is good.')
 
                     list_names = zip_object.namelist()
+                    #print(list_names)
+                    # we should do a quick survey to detect simple file mismatches
+                    ext_list = [i.split('.')[1].lower() for i in list_names if '.' in i]
+                    #print(ext_list)
+                    zip_result = zip_survey(ext_list)
+                    #print(ext_list, zip_result)
+                    if not ext_list:
+                        msg = 'Nothing extracted from ' + name
+                        print(msg)
+                        Problem.append(msg)
+                    elif zip_result < 0:
+                        print(f'No RAW detected in archive.')
+                    elif zip_result == 0:
+                        msg = 'More RAW detected than expected from ' + name
+                        print(msg)
+                        Problem.append([msg])
+
                     for file_name in list_names:
                         if file_name.lower().endswith(tuple(['.jpg', '.jpeg', '.dng'])):
-                            # Extract any file with these exts from zip
+                            # Extract any file with these exts from zip (skip RAW)
                             zip_object.extract(file_name, arc.parent)
-                            print(f'Extracting', file_name)
+                            # if verbose:
+                            #   print(f'Extracting', file_name)
+                            unpacked = 1
             # otherwise, fallback to shutil
             else:
-                # 3.6 this can't handle path objects
-                shutil.unpack_archive(str(arc), arc.parent)
+                try:
+                    # 3.6 this can't handle path objects
+                    shutil.unpack_archive(str(arc), arc.parent)
+                    unpacked = 1
+                except:
+                    print(f"Unexpected error unpacking:", arc, sys.exc_info()[0])
             result.append(new_folder)
             # print('unpacked', new_folder)
 
-            # remove the archive if everything worked
-            if delete_archive:
+            # remove the archive if it was unpacked
+            if delete_archive and unpacked == 1:
                 os.remove(arc)
+            elif delete_archive and unpacked == 0:
+                msg = 'Nothing was unpacked from archive named' + arc.name
+                print(f"Nothing was unpacked from archive named {arc.name}.")
+                Problem.append([msg])
         except ValueError:
             print(arc.stuffix, 'was not valid unpack archive type:', shutil.get_unpack_formats())
+            Problem.append(ValueError)
         except:
+            error = sys.exc_info()[0]
             print(f"Unexpected error:", sys.exc_info()[0])
+            Problem.append(error)
             # print("Unexpected error:")
             raise
 
     return result
 
-def scan_files(path=None, pattern=None, file_type=None):
-    """
-    Scan the directory for files matching the provided pattern.
-    Extract relevant parts from file for organization and sorting
-    Return a list of matching files
-    """
-    matches = []
-    # print('pattern:', pattern)
-    file_pattern = re.compile(pattern)
-    for root, dirs, files in os.walk(path):
-        #print(len(files))
-        for file in files:
-            # print(os.path.join(root, file))
-            m = file_pattern.match(file)
-            if m:
-                # print('matched', file, m.groupdict())
-                file_dict = m.groupdict()
-                file_path = os.path.join(root, file)
-                file_dict['file_path'] = file_path
-                file_dict['file_type'] = file_type
-                matches.append(file_dict)
-    print(f'match count', len(matches))
-    return matches
+deriv_values = {
+    'THUMB': {'DESIGNATOR' : '_thumb', 'SIZE' : 'x390'},
+    'MED' : {'DESIGNATOR' : '_med', 'SIZE' : 'x900'}}
 
-def arg_setup():
-    # set up argument parser
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--config", required=True, \
-        help="Path to the configuration file to be used for processing images.")
-    ap.add_argument("-i", "--input_path", required=False, \
-        help="Input directory path - overrides input_path in config file")
-    ap.add_argument("-v", "--verbose", action="store_true", \
-        help="Detailed output.")
-    ap.add_argument("-n", "--dry_run", action="store_true", \
-        help="Simulate the sort process without moving files or creating directories.")
-    ap.add_argument("-f", "--force", action="store_true", \
-        help="Force overwrite of existing files.")
-    ap.add_argument("-s", "--subset", action="store_true", \
-        help="Subset input folders by parent folder name of image (not parent of input folder).")
-    args = vars(ap.parse_args())
-    return args
+def generate_derivatives(path, settings):
+    '''
+    Takes a path, makes both deriv types from this img using wand.Image.
+    Saves right back where the Orig was located.
+    '''
 
-class Settings():
-    def __init__(self, prefix=None, dry_run=None, verbose=None, force_overwrite=None):
-        self.prefix = prefix
-        self.dry_run = dry_run
-        self.verbose = verbose
-        self.force_overwrite = force_overwrite
-        self.subset = subset
+    for k in deriv_values.keys():
+        try:
+            with Image(filename=path) as original:
+                with original.clone() as derivative:
+                    # resize height, preserve aspect ratio
+                    derivative.transform(resize=deriv_values[k]['SIZE'])
+                    derivative_path = os.path.join(path.parent, path.stem + deriv_values[k]['DESIGNATOR'] + path.suffix)
+                    #print(f'deriv path: {derivative_path}')
+                    derivative.save(filename=derivative_path)
+                    if settings.verbose:
+                        print(f"generated {deriv_values[k]['SIZE']}")
+                    #return derivative_path
+        except Exception as e:
+            print('Unable to create derivative:', e)
+            Problem.append(e)
+            #return None
 
-    def load_config(self, config_file=None):
-        # load config file
-        if config_file:
-            with open(config_file) as f:
-                config = json.load(f)
-                # print(config)
-                self.versions = config.get('versions', None)
-                self.config_format = self.versions.get('config_format')
-                self.collection = config.get('collection', None)
-                self.collection_prefix = self.collection.get('prefix', None)
-                self.catalog_number_regex = self.collection.get('catalog_number_regex', None)
-                self.files = config.get('files', None)
-                self.folder_increment = int(self.files.get('folder_increment', 1000))
-                self.log_directory_path = Path(self.files.get('log_directory_path', None))
-                self.number_pad = int(self.files.get('number_pad', 7))
-                self.output_base_path = Path(self.files.get('output_base_path', None))
-                # Get the type of files and patterns that will be scanned and sorted
-                self.file_types = config.get('file_types', None)
+def zip_survey(inp):
+    '''
+    Accept a list of extensions.
+    Check the RAW file count matches JPG/DNG.
+    Since only these are not unpacked.
+    '''
+    result = -1
+    raw_list = ['raw', 'nef', 'cr2']
+    jpg_list = ['jpg', 'jpeg']
+    # make a counter object, to get a nice dict with counts
+    c = Counter(inp)
+    #print(f'Zip Counter: {c}')
+    # if any raw formats, do stuff
+    if any(e in c.keys() for e in raw_list):
+        #print(f'need to count various exts')
+        # aggregate for variations of RAW files
+        raw_count = sum([c[i] for i in c if i in raw_list])
+        #print(f'count of raws: {raw_count}')
+        # aggregate for variations of JPG format
+        jpg_count = sum([c[i] for i in c if i in jpg_list])
+        #print(f'count of jpgs: {jpg_count}')
 
+        if raw_count == c['dng'] == jpg_count:
+            #print(f' > Needs Derivs Generated')
+            result = 1
+        elif raw_count == c['dng'] == jpg_count // 3:
+            #print(f' > Has Derivs Generated')
+            result = 1
+        elif raw_count > c['dng'] or raw_count > jpg_count:
+            #print(f' > More RAW than DNG or JPG')
+            result = 0
+        elif raw_count < c['dng'] or raw_count < jpg_count:
+            #print(f' > Less RAW than DNG or JPG')
+            result = 0
+        else:
+            #print(f' > UNCASED RESULT 0')
+            result = 0
+    else:
+        print(f'No RAW detected')
 
-if __name__ == '__main__':
-    # initialize settings
-    # set up argparse
-    args = arg_setup()
-    # print(args)
+    return result
+
+def ext_survey(inp):
+    '''
+    Accept a list of extensions.
+    Test some things, try to eval if anything is missing.
+    '''
+    #result = []
+    result = -1
+    raw_list = ['raw', 'nef', 'cr2']
+    jpg_list = ['jpg', 'jpeg']
+
+    # make a counter object, to get a nice dict with counts
+    c = Counter(inp)
+    #print(f'ext counter: {c}')
+
+    # if any raw formats, do stuff
+    #if any(e in c.keys() for e in raw_list):
+        #print(f'need to count various exts')
+    # aggregate for variations of RAW files
+    raw_count = sum([c[i] for i in c if i in raw_list])
+    #print(f'count of raws: {raw_count}')
+    # aggregate for variations of JPG format
+    jpg_count = sum([c[i] for i in c if i in jpg_list])
+    #print(f'count of jpgs: {jpg_count}')
+
+    # expecting NEF/DNG/JPG
+    #else:
+    if len(c) == 3:
+        print(f'probably the right ones?')
+        if raw_count == c['dng'] == jpg_count:
+            print(f' > Needs Derivs Generated')
+            result = 1
+        elif raw_count == c['dng'] == jpg_count // 3:
+            print(f' > Has Derivs Generated')
+            result = 1
+        else:
+            print(f' > UNCASED RESULT A')
+            result = 0
+    elif len(c) == 2:
+        print(f'probably missing raw? (acceptable)')
+        if c['dng'] == jpg_count:
+            print(f' > Needs Derivs Generated')
+            result = 1
+        elif c['dng'] == jpg_count//3:
+            print(f' > Has Derivs Generated')
+            result = 1
+        else:
+            print(f' > UNCASED RESULT B')
+            result = 0
+    elif len(c) == 1:
+        print(f' > probably just raw?')
+        #
+    else:
+        print(f' > UNCASED RESULT C')
+        result = 1
+
+    return result
+
+def main():
+    # set up argparse and get arguments
+    args = powersorter.arg_setup()
+
     config_file = args['config']
     dry_run = args['dry_run']
     verbose = args['verbose']
     force_overwrite = args['force']
     input_path_override = args['input_path']
     subset = args['subset']
+    unpack = args['unpack']
+    deriv = args['generate_derivatives']
 
-    """
-    #TODO reactivate input path override
-    if input_path_override:
-        input_path = Path(input_path_override)
-    else:
-        input_path = Path(files.get('input_path', None))
-
-    # Check existence of input path
-    if input_path:
-        # test to ensure input directory exists
-        if input_path.is_dir():
-            print('Sorting files from input_path:', input_path)
-        else:
-            print(f'ERROR: directory {input_path} does not exist.')
-            print('Terminating script.')
-            quit()
-    """
-    # Confirm force overwrite
+    #Confirm force overwrite
     force_overwrite_confirmed = False
     if force_overwrite:
         print('Files with identical names will be overwritten if you proceed.')
@@ -202,39 +283,18 @@ if __name__ == '__main__':
             force_overwrite_confirmed = False
             sys.exit()
 
-    settings = Settings(dry_run=dry_run, verbose=verbose, force_overwrite=force_overwrite_confirmed)
-    # Load settings from config
+    #Initialize settings with arg parameters
+    settings = powersorter.Settings(dry_run=dry_run, verbose=verbose, force_overwrite=force_overwrite_confirmed)
+    #Load settings from config file
     settings.load_config(config_file=config_file)
 
-    # Check required config_file version
-    if not str(settings.config_format) == CONFIG_FORMAT_REQUIRED:
-        print('Wrong config format version:', settings.config_format, 'Required:', CONFIG_FORMAT_REQUIRED)
-        sys.exit()
-
-    # Generate log file name and path
-    now = datetime.datetime.now()
-    log_filename = settings.collection_prefix + '_' + str(now.strftime('%Y-%m-%dT%H%M%S'))
-    if dry_run:
-        log_filename = log_filename + '_DRY-RUN'
-    log_filename = log_filename + '.csv'
-    log_file_path = settings.log_directory_path.joinpath(log_filename)
-
-    # get current username
-    try:
-        username = pwd.getpwuid(os.getuid()).pw_name
-    except:
-        print(f'ERROR - Unable to retrieve username.')
-        username = None
-
-    #csvfile = open(log_file_path, 'w', newline='')
-    #fieldnames = ['timestamp', 'username', 'action', 'result', 'details', 'filetype', 'source', 'destination']
-    #writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    #writer.writeheader()
-
-    input_path = Path(settings.files.get('input_path', None))
-    # print(settings.catalog_number_regex)
-
+    # input_path setting in config file can be overridden using value passed in args input_path_override
+    # getting path from settings isn't necessary, just here for illustration
+    # if input_path isn't passed to sort, it will use settings.input_path by default
+    input_path = settings.input_path
+    #print(f's.inp', settings.input_path, type(settings.input_path))
     # verify path exists before starting
+    #print(f'inp', input_path, type(input_path))
     try:
         os.path.isdir(input_path)
     except:
@@ -242,25 +302,205 @@ if __name__ == '__main__':
 
     # scan for archives
     archives = scan_for_archives(input_path)
-    print(f'archives found:', archives)
+    #print(f'archives found:', archives)
     # if any archives, unpack them
     if archives:
-        unpacked = unpack_archives(archives)  # , delete_archive=False
-        print(f'unpacked archives :', unpacked)
+        #print(f'Archives found: {archives}')
+        if dry_run and unpack:
+            print(f'Archives would have been unpacked: {archives}')
+        elif unpack:
+            unpacked = unpack_archives(archives)  # , delete_archive=False
+            print(f'unpacked archives: {unpacked}')
+        else:
+            print(f'Archives would have been unpacked if -unpack: {archives}')
 
     # subset based on parent folders, if flag says to
     if subset:
-        print(f'do subset here')
-    
-    # start sorting
-    # call powersorter.py
+        print(f'Starting SUBSET process')
+        # using chdir shortens the path glob returns to be SORTFOLDER/img.jpg
+        orig_dir = os.getcwd()
+        os.chdir(input_path)
 
-    # call url_gen.py
+        # this strongly supposes the files structure is /INPUT/sortable/jpg
+        # would be better to iterate on path/to/sortable?
+        parents = set([f.rpartition('/')[0] for f_ in [glob.glob(e, recursive = True) for e in ('./**/*.jpg', './**/*.jpeg')] for f in f_])
+        print(f'subsetting on:', parents)
+        # return chdir
+        os.chdir(orig_dir)
 
-    #csvfile.close()
-    # Summary report
-    print(f'PROCESS COMPLETE')
-    if verbose:
-        print('sorted_file_count', sorted_file_count)
-        print('unmoved_file_count', unmoved_file_count)
-    print(f'xLog file written to:', log_file_path)
+        # iterate on input+parent paths and call sort, url_gen
+        for p in parents:
+            subset_path = os.path.join(input_path, p)
+
+            # quick survey of contents (by ext)
+            ext_list = [i.suffix.replace('.', '') for i in Path(os.path.join(input_path, subset_path)).glob('*.*')]
+            #print(ext_list)
+            # strip the period out from .suffix
+            #ext_list = ext_list.replace('.', '')
+            ext_result = ext_survey(ext_list)
+            #print(ext_list, ext_result)
+
+            if deriv:
+                # print(f'Somehow gen derivs for', input_path)
+                # test = [f for f_ in [Path(input_path).rglob(e) for e in ('*/*.jpg', '*/*.jpeg')] for f in f_]
+                # print(f'test:', test)
+                # glob is not good at *not* matching stuff, like this gets all JPGs
+                # single folder the */*.jpg pattern fails
+                # will using rglob let this work for nested tho? seems good
+                #print(Path(os.path.join(input_path, subset_path)))
+                jpg_glob = [f for f_ in [Path(os.path.join(input_path, subset_path)).rglob(e) for e in ('*.jpg', '*.jpeg')] for f in f_]
+                #print(f'jpg grab', jpg_glob)
+                # but we could coarsely say, if there are none of these, then gen. still need regex for just the Pri JPGs.
+                med_glob = [f for f_ in [Path(os.path.join(input_path, subset_path)).rglob(e) for e in ('*_med.jpg', '*_med.jpeg')] for f in f_]
+                # print(f'med grab', med_glob)
+                thu_glob = [f for f_ in [Path(os.path.join(input_path, subset_path)).rglob(e) for e in ('*_thumb.jpg', '*_thumb.jpeg')] for f in
+                            f_]
+                # print(f'thu grab', thu_glob)
+
+                # only gen derivs if they are all missing
+                if (len(med_glob) < 1 and len(med_glob) < 1):
+                    print(f'both derivs req')
+                    # coarse glob of ALL jpgs
+                    path_jpg_pattern = re.compile('.*' + settings.catalog_number_regex + settings.web_jpg_regex)
+                    needs_derivs = []
+                    for i in jpg_glob:
+                        # print(i)
+                        # use regex to winnow glob down to just the Primary/Web JPG
+                        m = path_jpg_pattern.match(str(i))
+                        if m:
+                            # print(m, m.groupdict())
+                            needs_derivs.append(i)
+                    print(f' - generating {len(needs_derivs)} x2 derivs (will take a bit)')
+                    for i in needs_derivs:
+                        #print(i)
+                        generate_derivatives(i, settings)
+                elif len(med_glob) < 1:
+                    print(f' med derivs req')
+                elif len(thu_glob) < 1:
+                    print(f' thu derivs req')
+
+            print(f'sorting subfolder', subset_path)
+            sort_results = powersorter.sort(
+                settings_obj=settings, \
+                input_path=subset_path, #only diff is here \
+                number_pad=settings.number_pad, \
+                folder_increment=settings.folder_increment, \
+                catalog_number_regex=settings.catalog_number_regex, \
+                collection_prefix=settings.collection_prefix, \
+                file_types=settings.file_types, \
+                destination_base_path=settings.output_base_path)
+            # Summary report
+            if verbose:
+                print(f"sorted_file_count {sort_results['sorted_file_count']}")
+                print(f"unmoved_file_count {sort_results['unmoved_file_count']}")
+                if sort_results['unmoved_file_count']:
+                    print(f' < Leftover Files >')
+                    leftover_glob = [f for f_ in [Path(input_path).rglob(e) for e in ('*.jpg', '*.jpeg')] for f in f_]
+                    #print(f'left {leftover_glob}')
+                    for i in leftover_glob:
+                        print(f' - {i}')
+            print(f'Log file written to:', sort_results['log_file_path'])
+            print(f'Starting URL_GEN for the log file.')
+
+            occurrence_set = generate_url_records_suffixes(settings=settings, input_file=sort_results['log_file_path'])
+            # print(occurrence_set)
+            # Get input file name
+            #input_file_name_stem = Path(input_file).stem
+            input_file_name_stem = Path(sort_results['log_file_path']).stem
+            output_file_name = input_file_name_stem + '_urls.csv'
+            print(f'Writing urls to:', output_file_name)
+
+            with open(output_file_name, 'w', newline='') as csvfile:
+                fieldnames = ['catalog_number', 'large', 'web', 'thumbnail']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for key, image_set in occurrence_set.items():
+                    writer.writerow(image_set)
+
+    else:
+    # sort once
+        if deriv:
+            #print(f'Somehow gen derivs for', input_path)
+            #test = [f for f_ in [Path(input_path).rglob(e) for e in ('*/*.jpg', '*/*.jpeg')] for f in f_]
+            #print(f'test:', test)
+            # glob is not good at *not* matching stuff, like this gets all JPGs
+            # single folder the */*.jpg pattern fails
+            # will using rglob let this work for nested tho? seems good
+            jpg_glob = [f for f_ in [Path(input_path).rglob(e)for e in ('*.jpg', '*.jpeg')] for f in f_]
+            #print(f'jpg grab', jpg_glob)
+            # but we could coarsely say, if there are none of these, then gen. still need regex for just the Pri JPGs.
+            med_glob = [f for f_ in [Path(input_path).rglob(e) for e in ('*_med.jpg', '*_med.jpeg')] for f in f_]
+            #print(f'med grab', med_glob)
+            thu_glob = [f for f_ in [Path(input_path).rglob(e)for e in ('*_thumb.jpg', '*_thumb.jpeg')] for f in f_]
+            #print(f'thu grab', thu_glob)
+
+            # only gen derivs if they are all missing
+            if (len(med_glob) < 1 and len(med_glob) < 1):
+                print(f'both derivs req')
+                # coarse glob of ALL jpgs
+                path_jpg_pattern = re.compile('.*' + settings.catalog_number_regex + settings.web_jpg_regex)
+                needs_derivs = []
+                for i in jpg_glob:
+                    # print(i)
+                    # use regex to winnow glob down to just the Primary/Web JPG
+                    m = path_jpg_pattern.match(str(i))
+                    if m:
+                        # print(m, m.groupdict())
+                        needs_derivs.append(i)
+                print(f' - generating {len(needs_derivs)} x2 derivs (will take a bit)')
+                for i in needs_derivs:
+                    #print(i)
+                    generate_derivatives(i, settings)
+            elif len(med_glob) < 1:
+                print(f' med derivs req')
+            elif len(thu_glob) < 1:
+                print(f' thu derivs req')
+
+        print('STARTING sort')
+        sort_results = powersorter.sort(
+            settings_obj=settings, \
+            input_path=input_path, \
+            number_pad=settings.number_pad, \
+            folder_increment=settings.folder_increment, \
+            catalog_number_regex=settings.catalog_number_regex,\
+            collection_prefix=settings.collection_prefix, \
+            file_types=settings.file_types, \
+            destination_base_path=settings.output_base_path)
+        print(f'sort res: {sort_results}')
+
+        occurrence_set = generate_url_records_suffixes(settings=settings, input_file=sort_results['log_file_path'])
+        # print(occurrence_set)
+        # Get input file name
+        # input_file_name_stem = Path(input_file).stem
+        input_file_name_stem = Path(sort_results['log_file_path']).stem
+        output_file_name = input_file_name_stem + '_urls.csv'
+        print(f'Writing urls to:', output_file_name)
+
+        with open(output_file_name, 'w', newline='') as csvfile:
+            fieldnames = ['catalog_number', 'large', 'web', 'thumbnail']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for key, image_set in occurrence_set.items():
+                writer.writerow(image_set)
+
+        # Summary report
+        if verbose:
+            print(f"sorted_file_count {sort_results['sorted_file_count']}")
+            print(f"unmoved_file_count {sort_results['unmoved_file_count']}")
+            # ya know, it would be nice to know more about these
+        #print(sort_results['unmoved_file_count'])
+        if sort_results['unmoved_file_count']:
+            print(f' < Leftover Files >')
+            leftover_glob = [f for f_ in [Path(input_path).rglob(e)for e in ('*.jpg', '*.jpeg')] for f in f_]
+            print(f'left {leftover_glob}')
+            for i in leftover_glob:
+                print(f' - {i}')
+        print(f'Log file written to:', sort_results['log_file_path'])
+    print(f'Process COMPLETE')
+    if Problem:
+        print(f' < Problem listing >')
+        for i in Problem:
+            print(f' - {i}')
+
+if __name__ == '__main__':
+    main()
